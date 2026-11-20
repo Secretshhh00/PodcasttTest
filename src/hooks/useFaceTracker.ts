@@ -28,10 +28,11 @@ let modelsPromise: Promise<void> | null = null;
 
 async function ensureFaceModelsLoaded() {
   if (!modelsPromise) {
+    const modelsUri = `${import.meta.env.BASE_URL}models`;
     modelsPromise = (async () => {
       await Promise.all([
-        faceapi.nets.tinyFaceDetector.loadFromUri('/models'),
-        faceapi.nets.faceLandmark68TinyNet.loadFromUri('/models'),
+        faceapi.nets.tinyFaceDetector.loadFromUri(modelsUri),
+        faceapi.nets.faceLandmark68TinyNet.loadFromUri(modelsUri),
       ]);
     })();
   }

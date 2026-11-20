@@ -22,6 +22,7 @@ import { ambientAudioEngine } from '../utils/ambientAudio.ts';
 
 const CHANNEL_NAME = 'podcasthorizon-sync-v1';
 const AUDIO_LEADER_CHANNEL = 'podcasthorizon-audio-leader';
+const STORAGE_KEY = 'podcasthorizon-state-v1';
 const COMBO_WINDOW_MS = 4500;
 const FILTER_DURATION_MS = 14000;
 
@@ -73,6 +74,43 @@ const DEFAULT_STATE: LiveState = {
     sfxEnabled: true,
   },
 };
+
+function loadInitialState(): LiveState {
+  if (typeof window === 'undefined') return DEFAULT_STATE;
+  try {
+    const raw = window.localStorage.getItem(STORAGE_KEY);
+    if (!raw) return DEFAULT_STATE;
+    const parsed = JSON.parse(raw) as Partial<LiveState>;
+    if (!parsed || typeof parsed !== 'object') return DEFAULT_STATE;
+    const now = Date.now();
+    const rawFilter = parsed.faceFilter
+      ? { ...DEFAULT_STATE.faceFilter, ...parsed.faceFilter }
+      : DEFAULT_STATE.faceFilter;
+    const filterExpired =
+      !rawFilter.pinned &&
+      rawFilter.activeFilter !== null &&
+      rawFilter.expiresAt !== null &&
+      rawFilter.expiresAt <= now;
+    return {
+      ...DEFAULT_STATE,
+      ...parsed,
+      activeGifts: Array.isArray(parsed.activeGifts)
+        ? parsed.activeGifts.filter((g) => g.expiresAt > now)
+        : DEFAULT_STATE.activeGifts,
+      faceFilter: filterExpired
+        ? { ...rawFilter, activeFilter: null, activatedBy: null, expiresAt: null }
+        : rawFilter,
+      nowPlaying: parsed.nowPlaying
+        ? { ...DEFAULT_STATE.nowPlaying, ...parsed.nowPlaying }
+        : DEFAULT_STATE.nowPlaying,
+      ambientAudio: parsed.ambientAudio
+        ? { ...DEFAULT_STATE.ambientAudio, ...parsed.ambientAudio }
+        : DEFAULT_STATE.ambientAudio,
+    };
+  } catch {
+    return DEFAULT_STATE;
+  }
+}
 
 function reduceLocalState(prev: LiveState, action: SyncClientAction): LiveState {
   const now = Date.now();
@@ -240,12 +278,22 @@ function reduceLocalState(prev: LiveState, action: SyncClientAction): LiveState 
 }
 
 export function useLiveSync(options?: { defaultAudioLeader?: boolean }) {
-  const [state, setState] = useState<LiveState>(DEFAULT_STATE);
+  const [state, setState] = useState<LiveState>(loadInitialState);
   const [recentBursts, setRecentBursts] = useState<ReactionBurst[]>([]);
   const [isConnected, setIsConnected] = useState(false);
   const [isAudioLeader, setIsAudioLeader] = useState(
     options?.defaultAudioLeader ?? false,
   );
+
+  // Persist snapshot for newly opened tabs on static hosting (e.g. GitHub Pages)
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    } catch {
+      // Ignore storage quota / privacy errors
+    }
+  }, [state]);
 
   const tabIdRef = useRef<string>(makeEventId());
   const wsRef = useRef<WebSocket | null>(null);
@@ -356,15 +404,24 @@ export function useLiveSync(options?: { defaultAudioLeader?: boolean }) {
 
     let reconnectTimer: number | null = null;
     let disposed = false;
+    let hasConnectedWs = false;
+    let initialFailures = 0;
 
     const connectWs = () => {
       if (disposed) return;
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsUrl = `${protocol}//${window.location.host}/ws`;
-      const ws = new WebSocket(wsUrl);
+      let ws: WebSocket;
+      try {
+        ws = new WebSocket(wsUrl);
+      } catch {
+        return;
+      }
       wsRef.current = ws;
 
       ws.onopen = () => {
+        hasConnectedWs = true;
+        initialFailures = 0;
         setIsConnected(true);
       };
 
@@ -384,9 +441,13 @@ export function useLiveSync(options?: { defaultAudioLeader?: boolean }) {
       ws.onclose = () => {
         setIsConnected(false);
         wsRef.current = null;
-        if (!disposed) {
-          reconnectTimer = window.setTimeout(connectWs, 1500);
+        if (disposed) return;
+        if (!hasConnectedWs) {
+          initialFailures += 1;
+          // On static hosting (GitHub Pages), stop retrying /ws after 2 probes and use BroadcastChannel
+          if (initialFailures >= 2) return;
         }
+        reconnectTimer = window.setTimeout(connectWs, 1500);
       };
 
       ws.onerror = () => {

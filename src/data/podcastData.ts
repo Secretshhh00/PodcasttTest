@@ -5,11 +5,14 @@ import type {
   QaItem,
 } from '../types/live.ts';
 
-export const HOST_AVATAR_URL =
-  '/src/assets/images/host_avatar_horizon_1794981373658.jpg';
+const BASE_URL =
+  typeof import.meta !== 'undefined' && import.meta.env?.BASE_URL
+    ? import.meta.env.BASE_URL
+    : '/';
 
-export const COZY_BACKDROP_URL =
-  '/src/assets/images/cozy_studio_backdrop_1794981373521.jpg';
+export const HOST_AVATAR_URL = `${BASE_URL}src/assets/images/host_avatar_horizon_1794981373658.jpg`;
+
+export const COZY_BACKDROP_URL = `${BASE_URL}src/assets/images/cozy_studio_backdrop_1794981373521.jpg`;
 
 export const GIFT_CATALOG: GiftDefinition[] = [
   {

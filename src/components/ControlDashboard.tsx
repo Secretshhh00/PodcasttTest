@@ -291,10 +291,12 @@ export const ControlDashboard: React.FC<ControlDashboardProps> = ({
     return () => window.clearTimeout(timerId);
   }, [autoRandomGifts, state.isLive, triggerRandomGiftDrop]);
 
+  const stagePath = `${import.meta.env.BASE_URL}?mode=stage`;
+
   const stageUrl = useMemo(() => {
-    if (typeof window === 'undefined') return '/?mode=stage';
-    return `${window.location.origin}/?mode=stage`;
-  }, []);
+    if (typeof window === 'undefined') return stagePath;
+    return `${window.location.origin}${stagePath}`;
+  }, [stagePath]);
 
   const handleCopyStageUrl = async () => {
     try {
@@ -377,7 +379,7 @@ export const ControlDashboard: React.FC<ControlDashboardProps> = ({
                   isConnected ? 'bg-emerald-500' : 'bg-amber-500'
                 }`}
               />
-              {isConnected ? 'Tab Sync Live' : 'Local Sync'}
+              {isConnected ? 'Tab Sync Live' : 'Tab Sync Ready'}
             </span>
             <span aria-hidden="true">·</span>
             <span className="font-mono tabular-nums text-zinc-300">
@@ -398,7 +400,7 @@ export const ControlDashboard: React.FC<ControlDashboardProps> = ({
 
           <div className="flex items-center gap-2.5 shrink-0">
             <a
-              href="/?mode=stage"
+              href={stagePath}
               target="_blank"
               rel="noopener noreferrer"
               className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-[#FF3B5C] hover:bg-[#ff5270] text-white text-xs font-semibold shadow-sm transition-colors cursor-pointer whitespace-nowrap shrink-0"
