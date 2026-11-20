@@ -1,0 +1,11 @@
+{
+  "name": "podcastHorizon Live Studio",
+  "description": "TikTok-style live streaming stage and dual-tab producer control dashboard for podcastHorizon performances.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
