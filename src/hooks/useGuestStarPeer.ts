@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import Peer, { type DataConnection, type MediaConnection } from 'peerjs';
+import { CloudRelayClient } from '../utils/cloudRelay.ts';
 
 export type GuestPeerConnectionStatus =
   | 'idle'
@@ -35,7 +36,7 @@ export type StageSignalPayload =
   | { type: 'stage:redial' }
   | { type: 'stage:kick' };
 
-interface WsMediaRelayPacket {
+interface RelayPacket {
   type: 'media:relay';
   roomId: string;
   role: 'guest' | 'host';
@@ -45,6 +46,7 @@ interface WsMediaRelayPacket {
   mirrored?: boolean;
   micMuted?: boolean;
   joined?: boolean;
+  heartbeat?: boolean;
   bye?: boolean;
   hostName?: string;
   streamTitle?: string;
@@ -54,30 +56,12 @@ interface WsMediaRelayPacket {
   needFrames?: boolean;
 }
 
+// Fast reachable STUN servers (avoid dead public TURN servers that stall ICE gathering)
 const RTC_CONFIG: RTCConfiguration = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
-    {
-      urls: 'turn:openrelay.metered.ca:80',
-      username: 'openrelayproject',
-      credential: 'openrelayproject',
-    },
-    {
-      urls: 'turn:openrelay.metered.ca:443',
-      username: 'openrelayproject',
-      credential: 'openrelayproject',
-    },
-    {
-      urls: 'turn:openrelay.metered.ca:443?transport=tcp',
-      username: 'openrelayproject',
-      credential: 'openrelayproject',
-    },
-    {
-      urls: 'turns:openrelay.metered.ca:443?transport=tcp',
-      username: 'openrelayproject',
-      credential: 'openrelayproject',
-    },
+    { urls: 'stun:stun.cloudflare.com:3478' },
   ],
 };
 
@@ -89,9 +73,22 @@ export function getStagePeerId(roomId: string): string {
   return `ph-stage-${sanitizeRoomId(roomId)}`;
 }
 
+function getTopicHostToGuest(roomId: string): string {
+  return `podcasthorizon/v1/room/${sanitizeRoomId(roomId)}/host`;
+}
+
+function getTopicGuestToHost(roomId: string): string {
+  return `podcasthorizon/v1/room/${sanitizeRoomId(roomId)}/guest`;
+}
+
+function supportsLocalWs(): boolean {
+  if (typeof window === 'undefined') return false;
+  return !window.location.hostname.endsWith('.github.io');
+}
+
 /**
  * Creates a live ticking fallback MediaStream with BOTH video & silent audio tracks
- * so WebRTC SDP negotiates both m-lines cleanly and allows seamless replaceTrack/redial.
+ * so WebRTC SDP negotiates both m-lines cleanly and allows seamless track replacement.
  */
 function createFallbackMediaStream(): {
   stream: MediaStream;
@@ -146,7 +143,10 @@ function createFallbackMediaStream(): {
 }
 
 /**
- * Streams compressed JPEG frames from a local MediaStream when WebRTC UDP/TURN is blocked.
+ * Streams lightweight JPEG frames from a local MediaStream over WSS / DataChannel
+ * whenever WebRTC UDP cannot traverse mobile carrier CGNAT.
+ * IMPORTANT: Appends a tiny 2px off-screen <video> into document.body so iOS Safari
+ * & Android Chrome do not suspend off-DOM MediaStream video decoding.
  */
 function useFrameRelaySender(options: {
   enabled: boolean;
@@ -154,19 +154,29 @@ function useFrameRelaySender(options: {
   onFrame: (dataUrl: string) => void;
   fps?: number;
 }) {
-  const { enabled, stream, onFrame, fps = 11 } = options;
+  const { enabled, stream, onFrame, fps = 9 } = options;
   const onFrameRef = useRef(onFrame);
   onFrameRef.current = onFrame;
 
   useEffect(() => {
     if (!enabled || !stream) return;
-    const videoTracks = stream.getVideoTracks();
-    if (videoTracks.length === 0) return;
+    if (stream.getVideoTracks().length === 0) return;
 
     const video = document.createElement('video');
     video.muted = true;
     video.playsInline = true;
+    video.autoplay = true;
+    video.setAttribute('playsinline', 'true');
+    video.setAttribute('muted', 'true');
+    video.style.position = 'fixed';
+    video.style.left = '-24px';
+    video.style.top = '-24px';
+    video.style.width = '2px';
+    video.style.height = '2px';
+    video.style.opacity = '0.001';
+    video.style.pointerEvents = 'none';
     video.srcObject = stream;
+    document.body.appendChild(video);
     video.play().catch(() => undefined);
 
     const canvas = document.createElement('canvas');
@@ -175,20 +185,27 @@ function useFrameRelaySender(options: {
 
     const timer = window.setInterval(() => {
       if (disposed || !ctx) return;
-      if (video.readyState < 2 || video.videoWidth === 0) return;
-      const targetW = 360;
-      const aspect = video.videoHeight / video.videoWidth || 1.33;
-      const targetH = Math.max(180, Math.round(targetW * aspect));
+      if (video.paused) {
+        video.play().catch(() => undefined);
+      }
+      if (video.readyState < 2 || video.videoWidth === 0 || video.videoHeight === 0) {
+        return;
+      }
+      const maxDim = 320;
+      const scale = Math.min(1, maxDim / Math.max(video.videoWidth, video.videoHeight));
+      const targetW = Math.max(120, Math.round(video.videoWidth * scale));
+      const targetH = Math.max(120, Math.round(video.videoHeight * scale));
+
       if (canvas.width !== targetW || canvas.height !== targetH) {
         canvas.width = targetW;
         canvas.height = targetH;
       }
       ctx.drawImage(video, 0, 0, targetW, targetH);
       try {
-        const dataUrl = canvas.toDataURL('image/jpeg', 0.58);
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.56);
         onFrameRef.current(dataUrl);
       } catch {
-        // Ignore canvas export error
+        // Ignore transient canvas export errors
       }
     }, Math.round(1000 / fps));
 
@@ -196,14 +213,17 @@ function useFrameRelaySender(options: {
       disposed = true;
       window.clearInterval(timer);
       video.srcObject = null;
+      if (video.parentNode) {
+        video.parentNode.removeChild(video);
+      }
     };
   }, [enabled, fps, stream]);
 }
 
 /**
  * Used on LiveStageView (Host / Output Tab).
- * Listens on `ph-stage-<roomId>` via BOTH PeerJS WebRTC and `/ws` fallback relay
- * so Device 1 (mobile phone) always displays live even behind strict mobile NATs.
+ * Listens simultaneously via PeerJS WebRTC, Cloud WSS Relay (works on GitHub Pages!),
+ * and local `/ws` relay so Device 1 (mobile phone) displays reliably across any network.
  */
 export function useStageGuestPeer(options: {
   roomId: string;
@@ -238,16 +258,20 @@ export function useStageGuestPeer(options: {
   const [guestStream, setGuestStream] = useState<MediaStream | null>(null);
   const [guestFallbackFrame, setGuestFallbackFrame] = useState<string | null>(null);
   const [guestHasDecodedVideo, setGuestHasDecodedVideo] = useState(false);
-  const [guestNeedsHostFrames, setGuestNeedsHostFrames] = useState(false);
+  const [guestNeedsHostFrames, setGuestNeedsHostFrames] = useState(true);
+  const [relayGuestConnected, setRelayGuestConnected] = useState(false);
   const [peerReady, setPeerReady] = useState(false);
 
   const peerRef = useRef<Peer | null>(null);
   const activeCallRef = useRef<MediaConnection | null>(null);
   const activeDataRef = useRef<DataConnection | null>(null);
   const wsRelayRef = useRef<WebSocket | null>(null);
+  const cloudRelayRef = useRef<CloudRelayClient | null>(null);
   const answeredWithFallbackRef = useRef(false);
-  const wsGuestActiveRef = useRef(false);
-  const lastWsMetaKeyRef = useRef('');
+  const relayGuestActiveRef = useRef(false);
+  const lastGuestActivityRef = useRef(0);
+  const lastMetaKeyRef = useRef('');
+
   const localStreamRef = useRef<MediaStream | null>(localStream);
   localStreamRef.current = localStream;
   const guestDecodedRef = useRef(guestHasDecodedVideo);
@@ -262,6 +286,21 @@ export function useStageGuestPeer(options: {
     onGuestConnected,
     onGuestDisconnected,
     onGuestMeta,
+  };
+
+  const stageMetaRef = useRef({
+    hostName,
+    streamTitle,
+    isLive,
+    guestMuted,
+    guestName,
+  });
+  stageMetaRef.current = {
+    hostName,
+    streamTitle,
+    isLive,
+    guestMuted,
+    guestName,
   };
 
   const syncPayloadRef = useRef<StageSignalPayload>({
@@ -283,19 +322,19 @@ export function useStageGuestPeer(options: {
     stageNeedsFrames: !guestHasDecodedVideo,
   };
 
-  const sendWsRelay = useCallback(
-    (payload: Omit<WsMediaRelayPacket, 'type' | 'roomId' | 'role'>) => {
+  const sendRelayPacket = useCallback(
+    (payload: Omit<RelayPacket, 'type' | 'roomId' | 'role'>) => {
+      const fullPacket: RelayPacket = {
+        type: 'media:relay',
+        roomId,
+        role: 'host',
+        ...payload,
+      };
+      cloudRelayRef.current?.publish(getTopicHostToGuest(roomId), fullPacket);
       const ws = wsRelayRef.current;
       if (ws && ws.readyState === WebSocket.OPEN) {
         try {
-          ws.send(
-            JSON.stringify({
-              type: 'media:relay',
-              roomId,
-              role: 'host',
-              ...payload,
-            } satisfies WsMediaRelayPacket),
-          );
+          ws.send(JSON.stringify(fullPacket));
         } catch {
           // Ignore
         }
@@ -303,6 +342,77 @@ export function useStageGuestPeer(options: {
     },
     [roomId],
   );
+
+  const handleIncomingRelayMessage = useCallback(
+    (msg: RelayPacket) => {
+      if (
+        !msg ||
+        msg.type !== 'media:relay' ||
+        msg.roomId !== roomId ||
+        msg.role !== 'guest'
+      ) {
+        return;
+      }
+
+      if (msg.bye) {
+        relayGuestActiveRef.current = false;
+        lastMetaKeyRef.current = '';
+        setRelayGuestConnected(false);
+        setGuestFallbackFrame(null);
+        setGuestNeedsHostFrames(true);
+        if (!activeCallRef.current) {
+          callbacksRef.current.onGuestDisconnected();
+        }
+        return;
+      }
+
+      lastGuestActivityRef.current = Date.now();
+
+      if (msg.joined || !relayGuestActiveRef.current) {
+        const wasActive = relayGuestActiveRef.current;
+        relayGuestActiveRef.current = true;
+        setRelayGuestConnected(true);
+        if (!wasActive) {
+          callbacksRef.current.onGuestConnected();
+        }
+        if (msg.joined || !wasActive) {
+          const meta = stageMetaRef.current;
+          sendRelayPacket({
+            hostName: meta.hostName,
+            streamTitle: meta.streamTitle,
+            isLive: meta.isLive,
+            guestMutedByHost: meta.guestMuted,
+            needFrames: !guestDecodedRef.current,
+          });
+        }
+      }
+
+      if (typeof msg.needFrames === 'boolean') {
+        setGuestNeedsHostFrames(msg.needFrames);
+      }
+
+      if (msg.name !== undefined || msg.camOff !== undefined) {
+        const metaKey = `${msg.name ?? ''}|${Boolean(msg.camOff)}|${Boolean(msg.micMuted)}|${msg.mirrored ?? true}`;
+        if (metaKey !== lastMetaKeyRef.current) {
+          lastMetaKeyRef.current = metaKey;
+          callbacksRef.current.onGuestMeta({
+            name: msg.name || 'Guest Star',
+            camOff: Boolean(msg.camOff),
+            micMuted: Boolean(msg.micMuted),
+            mirrored: msg.mirrored ?? true,
+          });
+        }
+      }
+
+      if (msg.frame) {
+        setGuestFallbackFrame(msg.frame);
+      }
+    },
+    [roomId, sendRelayPacket],
+  );
+
+  const handleRelayRef = useRef(handleIncomingRelayMessage);
+  handleRelayRef.current = handleIncomingRelayMessage;
 
   // Push stage metadata updates to Guest Star whenever Host updates title/mute/live/decoded state
   useEffect(() => {
@@ -314,7 +424,7 @@ export function useStageGuestPeer(options: {
         // Ignore transient send errors
       }
     }
-    sendWsRelay({
+    sendRelayPacket({
       hostName,
       streamTitle,
       isLive,
@@ -327,13 +437,16 @@ export function useStageGuestPeer(options: {
     guestName,
     hostName,
     isLive,
-    sendWsRelay,
+    sendRelayPacket,
     streamTitle,
   ]);
 
-  // Send fallback Host frames to Guest Star if Guest Star cannot decode Host WebRTC stream
+  // Send fallback Host frames to Guest Star whenever Guest needs frames over relay
   useFrameRelaySender({
-    enabled: guestNeedsHostFrames && Boolean(localStream),
+    enabled:
+      guestNeedsHostFrames &&
+      Boolean(localStream) &&
+      (relayGuestConnected || Boolean(activeCallRef.current)),
     stream: localStream,
     onFrame: (frame) => {
       if (activeDataRef.current?.open) {
@@ -346,7 +459,7 @@ export function useStageGuestPeer(options: {
           // Ignore
         }
       }
-      sendWsRelay({ frame });
+      sendRelayPacket({ frame });
     },
   });
 
@@ -358,8 +471,7 @@ export function useStageGuestPeer(options: {
     if (call.peerConnection) {
       const videoTrack = localStream.getVideoTracks()[0];
       const audioTrack = localStream.getAudioTracks()[0];
-      const senders = call.peerConnection.getSenders();
-      senders.forEach((sender) => {
+      call.peerConnection.getSenders().forEach((sender) => {
         if (sender.track?.kind === 'video' && videoTrack) {
           sender.replaceTrack(videoTrack).catch(() => undefined);
         }
@@ -382,102 +494,69 @@ export function useStageGuestPeer(options: {
     }
   }, [localStream]);
 
-  // WebSocket fallback relay listener (for AI Studio / Node server deployments)
+  // Cloud WSS Relay + Optional Local /ws Relay + Staleness Watchdog
   useEffect(() => {
-    let disposed = false;
+    const cloud = new CloudRelayClient({
+      subscribeTopic: getTopicGuestToHost(roomId),
+      onMessage: (raw) => {
+        handleRelayRef.current(raw as RelayPacket);
+      },
+    });
+    cloudRelayRef.current = cloud;
+
     let ws: WebSocket | null = null;
-
-    try {
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
-      wsRelayRef.current = ws;
-
-      ws.onmessage = (event) => {
-        if (disposed) return;
-        try {
-          const msg = JSON.parse(event.data) as WsMediaRelayPacket;
-          if (
-            msg?.type !== 'media:relay' ||
-            msg.roomId !== roomId ||
-            msg.role !== 'guest'
-          ) {
-            return;
+    if (supportsLocalWs()) {
+      try {
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+        wsRelayRef.current = ws;
+        ws.onmessage = (event) => {
+          try {
+            handleRelayRef.current(JSON.parse(event.data) as RelayPacket);
+          } catch {
+            // Ignore non-relay payloads
           }
-
-          if (msg.bye) {
-            wsGuestActiveRef.current = false;
-            lastWsMetaKeyRef.current = '';
-            setGuestFallbackFrame(null);
-            setGuestNeedsHostFrames(false);
-            if (!activeCallRef.current) {
-              callbacksRef.current.onGuestDisconnected();
-            }
-            return;
-          }
-
-          if (msg.joined && !wsGuestActiveRef.current) {
-            wsGuestActiveRef.current = true;
-            callbacksRef.current.onGuestConnected();
-            sendWsRelay({
-              hostName,
-              streamTitle,
-              isLive,
-              guestMutedByHost: guestMuted,
-              needFrames: !guestDecodedRef.current,
-            });
-          }
-
-          if (typeof msg.needFrames === 'boolean') {
-            setGuestNeedsHostFrames(msg.needFrames);
-          }
-
-          if (msg.name !== undefined || msg.camOff !== undefined) {
-            const metaKey = `${msg.name ?? ''}|${Boolean(msg.camOff)}|${Boolean(msg.micMuted)}|${msg.mirrored ?? true}`;
-            if (metaKey !== lastWsMetaKeyRef.current) {
-              lastWsMetaKeyRef.current = metaKey;
-              callbacksRef.current.onGuestMeta({
-                name: msg.name || 'Guest Star',
-                camOff: Boolean(msg.camOff),
-                micMuted: Boolean(msg.micMuted),
-                mirrored: msg.mirrored ?? true,
-              });
-            }
-          }
-
-          if (msg.frame) {
-            setGuestFallbackFrame(msg.frame);
-            if (!wsGuestActiveRef.current) {
-              wsGuestActiveRef.current = true;
-              callbacksRef.current.onGuestConnected();
-            }
-          }
-        } catch {
-          // Ignore non-relay WS payloads
-        }
-      };
-
-      ws.onerror = () => {
-        // Silent — GitHub Pages static hosting has no /ws server
-      };
-    } catch {
-      // Ignore WS creation failure
+        };
+        ws.onerror = () => {
+          // Silent fallback
+        };
+      } catch {
+        // Ignore WS failure
+      }
     }
 
+    const watchdogTimer = window.setInterval(() => {
+      if (
+        relayGuestActiveRef.current &&
+        !activeCallRef.current &&
+        Date.now() - lastGuestActivityRef.current > 15000
+      ) {
+        relayGuestActiveRef.current = false;
+        lastMetaKeyRef.current = '';
+        setRelayGuestConnected(false);
+        setGuestFallbackFrame(null);
+        callbacksRef.current.onGuestDisconnected();
+      }
+    }, 3000);
+
     return () => {
-      disposed = true;
+      window.clearInterval(watchdogTimer);
+      cloud.close();
+      cloudRelayRef.current = null;
       wsRelayRef.current = null;
       if (ws && ws.readyState <= WebSocket.OPEN) {
         ws.close();
       }
     };
-  }, [guestMuted, hostName, isLive, roomId, sendWsRelay, streamTitle]);
+  }, [roomId]);
 
+  // PeerJS WebRTC Listener (Native HD Video & Bidirectional Audio when NAT allows)
   useEffect(() => {
     let disposed = false;
     let retryTimer: number | null = null;
     let fallbackCleanup: (() => void) | null = null;
 
-    const closeGuestSession = (notifyDisconnected: boolean) => {
+    const closeWebRtcSession = (notifyIfNoRelay: boolean) => {
       if (activeCallRef.current) {
         activeCallRef.current.close();
         activeCallRef.current = null;
@@ -491,13 +570,10 @@ export function useStageGuestPeer(options: {
         fallbackCleanup = null;
       }
       answeredWithFallbackRef.current = false;
-      wsGuestActiveRef.current = false;
-      lastWsMetaKeyRef.current = '';
       setGuestStream(null);
-      setGuestFallbackFrame(null);
       setGuestHasDecodedVideo(false);
-      setGuestNeedsHostFrames(false);
-      if (notifyDisconnected) {
+      if (notifyIfNoRelay && !relayGuestActiveRef.current) {
+        setGuestFallbackFrame(null);
         callbacksRef.current.onGuestDisconnected();
       }
     };
@@ -520,7 +596,7 @@ export function useStageGuestPeer(options: {
           try {
             peer.reconnect();
           } catch {
-            // Ignore reconnect failure
+            // Ignore
           }
         }
       });
@@ -556,14 +632,17 @@ export function useStageGuestPeer(options: {
           } else if (msg.type === 'guest:frame') {
             setGuestFallbackFrame(msg.frame);
           } else if (msg.type === 'guest:bye') {
-            closeGuestSession(true);
+            relayGuestActiveRef.current = false;
+            setRelayGuestConnected(false);
+            setGuestFallbackFrame(null);
+            closeWebRtcSession(true);
           }
         });
 
         conn.on('close', () => {
           if (activeDataRef.current === conn) {
             activeDataRef.current = null;
-            closeGuestSession(true);
+            closeWebRtcSession(true);
           }
         });
       });
@@ -593,8 +672,8 @@ export function useStageGuestPeer(options: {
 
         if (call.peerConnection) {
           call.peerConnection.oniceconnectionstatechange = () => {
-            const state = call.peerConnection?.iceConnectionState;
-            if (state === 'failed') {
+            const iceState = call.peerConnection?.iceConnectionState;
+            if (iceState === 'failed') {
               call.peerConnection?.restartIce?.();
             }
           };
@@ -610,7 +689,7 @@ export function useStageGuestPeer(options: {
           if (activeCallRef.current === call) {
             activeCallRef.current = null;
             setGuestStream(null);
-            if (!wsGuestActiveRef.current) {
+            if (!relayGuestActiveRef.current) {
               callbacksRef.current.onGuestDisconnected();
             }
           }
@@ -620,7 +699,7 @@ export function useStageGuestPeer(options: {
           if (activeCallRef.current === call) {
             activeCallRef.current = null;
             setGuestStream(null);
-            if (!wsGuestActiveRef.current) {
+            if (!relayGuestActiveRef.current) {
               callbacksRef.current.onGuestDisconnected();
             }
           }
@@ -641,7 +720,7 @@ export function useStageGuestPeer(options: {
               peer.destroy();
               initPeer();
             }
-          }, 1800);
+          }, 2200);
         }
       });
     };
@@ -660,7 +739,7 @@ export function useStageGuestPeer(options: {
       window.removeEventListener('beforeunload', handleBeforeUnload);
       setPeerReady(false);
       if (retryTimer) window.clearTimeout(retryTimer);
-      closeGuestSession(false);
+      closeWebRtcSession(false);
       if (peerRef.current) {
         peerRef.current.destroy();
         peerRef.current = null;
@@ -678,7 +757,7 @@ export function useStageGuestPeer(options: {
         // Ignore
       }
     }
-    sendWsRelay({ kick: true });
+    sendRelayPacket({ kick: true });
     if (activeCallRef.current) {
       activeCallRef.current.close();
       activeCallRef.current = null;
@@ -687,26 +766,28 @@ export function useStageGuestPeer(options: {
       activeDataRef.current.close();
       activeDataRef.current = null;
     }
-    wsGuestActiveRef.current = false;
-    lastWsMetaKeyRef.current = '';
+    relayGuestActiveRef.current = false;
+    lastMetaKeyRef.current = '';
+    setRelayGuestConnected(false);
     setGuestStream(null);
     setGuestFallbackFrame(null);
     setGuestHasDecodedVideo(false);
     callbacksRef.current.onGuestDisconnected();
-  }, [sendWsRelay]);
+  }, [sendRelayPacket]);
 
   return {
     guestStream,
     guestFallbackFrame,
     setGuestHasDecodedVideo,
-    peerReady,
+    peerReady: peerReady || relayGuestConnected,
     disconnectGuest,
   };
 }
 
 /**
  * Used on GuestStarView (Device 1 / Guest Star Join Link).
- * Connects to Host's Live Stage `ph-stage-<roomId>` via PeerJS WebRTC + `/ws` fallback relay.
+ * Maintains an always-on Cloud WSS Relay connection (works on GitHub Pages & mobile 4G)
+ * while independently attempting WebRTC PeerJS upgrade without causing reconnect loops.
  */
 export function useGuestDevicePeer(options: {
   roomId: string;
@@ -723,7 +804,9 @@ export function useGuestDevicePeer(options: {
   const [hostFallbackFrame, setHostFallbackFrame] = useState<string | null>(null);
   const [hostHasDecodedVideo, setHostHasDecodedVideo] = useState(false);
   const [stageNeedsFrames, setStageNeedsFrames] = useState(true);
-  const [wsRelayConnected, setWsRelayConnected] = useState(false);
+  const [cloudRelayOpen, setCloudRelayOpen] = useState(false);
+  const [wsRelayOpen, setWsRelayOpen] = useState(false);
+  const [dataConnOpen, setDataConnOpen] = useState(false);
   const [stageInfo, setStageInfo] = useState<{
     hostName: string;
     streamTitle: string;
@@ -740,9 +823,13 @@ export function useGuestDevicePeer(options: {
   const callRef = useRef<MediaConnection | null>(null);
   const dataRef = useRef<DataConnection | null>(null);
   const wsRelayRef = useRef<WebSocket | null>(null);
-  const retryTimerRef = useRef<number | null>(null);
+  const cloudRelayRef = useRef<CloudRelayClient | null>(null);
+  const webrtcRetryTimerRef = useRef<number | null>(null);
+  const heartbeatTimerRef = useRef<number | null>(null);
+  const webrtcAttemptsRef = useRef(0);
   const joinedWantedRef = useRef(false);
   const calledWithFallbackRef = useRef(false);
+  const hostSeenOverRelayRef = useRef(false);
   const localStreamRef = useRef<MediaStream | null>(localStream);
   localStreamRef.current = localStream;
   const fallbackCleanupRef = useRef<(() => void) | null>(null);
@@ -764,19 +851,19 @@ export function useGuestDevicePeer(options: {
     needHostFrames: !hostHasDecodedVideo,
   };
 
-  const sendWsRelay = useCallback(
-    (payload: Omit<WsMediaRelayPacket, 'type' | 'roomId' | 'role'>) => {
+  const sendRelayPacket = useCallback(
+    (payload: Omit<RelayPacket, 'type' | 'roomId' | 'role'>) => {
+      const fullPacket: RelayPacket = {
+        type: 'media:relay',
+        roomId,
+        role: 'guest',
+        ...payload,
+      };
+      cloudRelayRef.current?.publish(getTopicGuestToHost(roomId), fullPacket);
       const ws = wsRelayRef.current;
       if (ws && ws.readyState === WebSocket.OPEN) {
         try {
-          ws.send(
-            JSON.stringify({
-              type: 'media:relay',
-              roomId,
-              role: 'guest',
-              ...payload,
-            } satisfies WsMediaRelayPacket),
-          );
+          ws.send(JSON.stringify(fullPacket));
         } catch {
           // Ignore
         }
@@ -795,7 +882,7 @@ export function useGuestDevicePeer(options: {
       }
     }
     if (joinedWantedRef.current) {
-      sendWsRelay({
+      sendRelayPacket({
         name: guestName.trim() || 'Guest Star',
         camOff,
         micMuted,
@@ -803,19 +890,26 @@ export function useGuestDevicePeer(options: {
         needFrames: !hostHasDecodedVideo,
       });
     }
-  }, [guestName, camOff, micMuted, mirrored, hostHasDecodedVideo, sendWsRelay]);
+  }, [
+    camOff,
+    guestName,
+    hostHasDecodedVideo,
+    micMuted,
+    mirrored,
+    sendRelayPacket,
+  ]);
 
-  // Send lightweight camera frame fallback when Stage hasn't decoded WebRTC video yet
   const isActivelyJoined =
     status === 'connecting' || status === 'connected' || status === 'waiting_stage';
 
+  // Stream Guest Star camera frames over WSS/DataChannel whenever Stage needs them
   useFrameRelaySender({
     enabled:
       isActivelyJoined &&
       !camOff &&
       Boolean(localStream) &&
       stageNeedsFrames &&
-      (wsRelayConnected || Boolean(dataRef.current?.open)),
+      (cloudRelayOpen || wsRelayOpen || dataConnOpen),
     stream: localStream,
     onFrame: (frame) => {
       if (dataRef.current?.open) {
@@ -828,16 +922,14 @@ export function useGuestDevicePeer(options: {
           // Ignore
         }
       }
-      sendWsRelay({
-        frame,
-      });
+      sendRelayPacket({ frame });
     },
   });
 
-  const cleanupPeer = useCallback(() => {
-    if (retryTimerRef.current) {
-      window.clearTimeout(retryTimerRef.current);
-      retryTimerRef.current = null;
+  const cleanupWebRtc = useCallback(() => {
+    if (webrtcRetryTimerRef.current) {
+      window.clearTimeout(webrtcRetryTimerRef.current);
+      webrtcRetryTimerRef.current = null;
     }
     if (dataRef.current) {
       if (dataRef.current.open) {
@@ -852,6 +944,7 @@ export function useGuestDevicePeer(options: {
       dataRef.current.close();
       dataRef.current = null;
     }
+    setDataConnOpen(false);
     if (callRef.current) {
       callRef.current.close();
       callRef.current = null;
@@ -865,90 +958,35 @@ export function useGuestDevicePeer(options: {
       peerRef.current.destroy();
       peerRef.current = null;
     }
+    setHostStream(null);
+    setHostHasDecodedVideo(false);
+  }, []);
+
+  const cleanupAll = useCallback(() => {
+    if (heartbeatTimerRef.current) {
+      window.clearInterval(heartbeatTimerRef.current);
+      heartbeatTimerRef.current = null;
+    }
+    cleanupWebRtc();
+    sendRelayPacket({ bye: true });
+    if (cloudRelayRef.current) {
+      cloudRelayRef.current.close();
+      cloudRelayRef.current = null;
+    }
     if (wsRelayRef.current && wsRelayRef.current.readyState <= WebSocket.OPEN) {
-      sendWsRelay({ bye: true });
       wsRelayRef.current.close();
       wsRelayRef.current = null;
     }
-    setWsRelayConnected(false);
-    setHostStream(null);
+    hostSeenOverRelayRef.current = false;
+    setCloudRelayOpen(false);
+    setWsRelayOpen(false);
     setHostFallbackFrame(null);
-    setHostHasDecodedVideo(false);
     setStageNeedsFrames(true);
-  }, [sendWsRelay]);
+  }, [cleanupWebRtc, sendRelayPacket]);
 
-  const connectToStage = useCallback(() => {
+  const startWebRtcPeer = useCallback(() => {
     if (!joinedWantedRef.current) return;
-    cleanupPeer();
-    setStatus('connecting');
-
-    // Open parallel /ws relay channel if server.ts is available
-    try {
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
-      wsRelayRef.current = ws;
-
-      ws.onopen = () => {
-        if (!joinedWantedRef.current) return;
-        setWsRelayConnected(true);
-        sendWsRelay({
-          joined: true,
-          name: metaRef.current.type === 'guest:meta' ? metaRef.current.name : 'Guest Star',
-          camOff: metaRef.current.type === 'guest:meta' ? metaRef.current.camOff : false,
-          micMuted: metaRef.current.type === 'guest:meta' ? metaRef.current.micMuted : false,
-          mirrored: metaRef.current.type === 'guest:meta' ? metaRef.current.mirrored : true,
-          needFrames: true,
-        });
-      };
-
-      ws.onmessage = (event) => {
-        if (!joinedWantedRef.current) return;
-        try {
-          const msg = JSON.parse(event.data) as WsMediaRelayPacket;
-          if (
-            msg?.type !== 'media:relay' ||
-            msg.roomId !== roomId ||
-            msg.role !== 'host'
-          ) {
-            return;
-          }
-
-          if (msg.kick) {
-            joinedWantedRef.current = false;
-            cleanupPeer();
-            setStatus('kicked');
-            return;
-          }
-
-          if (msg.hostName || msg.streamTitle) {
-            setStageInfo((prev) => ({
-              hostName: msg.hostName ?? prev.hostName,
-              streamTitle: msg.streamTitle ?? prev.streamTitle,
-              isLive: msg.isLive ?? prev.isLive,
-              guestMutedByHost: msg.guestMutedByHost ?? prev.guestMutedByHost,
-            }));
-            setStatus((prev) => (prev === 'connecting' || prev === 'waiting_stage' ? 'connected' : prev));
-          }
-
-          if (typeof msg.needFrames === 'boolean') {
-            setStageNeedsFrames(msg.needFrames);
-          }
-
-          if (msg.frame) {
-            setHostFallbackFrame(msg.frame);
-            setStatus('connected');
-          }
-        } catch {
-          // Ignore non-relay payloads
-        }
-      };
-
-      ws.onclose = () => {
-        setWsRelayConnected(false);
-      };
-    } catch {
-      // Ignore WS creation failure on static hosting
-    }
+    cleanupWebRtc();
 
     const guestId = `ph-guest-${sanitizeRoomId(roomId)}-${Math.random()
       .toString(36)
@@ -961,6 +999,18 @@ export function useGuestDevicePeer(options: {
     });
     peerRef.current = peer;
 
+    const scheduleQuietWebRtcRetry = () => {
+      if (!joinedWantedRef.current) return;
+      if (webrtcAttemptsRef.current >= 2) return;
+      webrtcAttemptsRef.current += 1;
+      if (!webrtcRetryTimerRef.current) {
+        webrtcRetryTimerRef.current = window.setTimeout(() => {
+          webrtcRetryTimerRef.current = null;
+          startWebRtcPeer();
+        }, 5000);
+      }
+    };
+
     const dialStage = () => {
       if (!joinedWantedRef.current || peer.destroyed) return;
 
@@ -968,6 +1018,7 @@ export function useGuestDevicePeer(options: {
       dataRef.current = dataConn;
 
       dataConn.on('open', () => {
+        setDataConnOpen(true);
         try {
           dataConn.send(metaRef.current);
         } catch {
@@ -988,26 +1039,27 @@ export function useGuestDevicePeer(options: {
           if (typeof msg.stageNeedsFrames === 'boolean') {
             setStageNeedsFrames(msg.stageNeedsFrames);
           }
+          setStatus('connected');
         } else if (msg.type === 'stage:frame') {
           setHostFallbackFrame(msg.frame);
+          setStatus('connected');
         } else if (msg.type === 'stage:redial') {
           if (joinedWantedRef.current) {
-            connectToStage();
+            startWebRtcPeer();
           }
         } else if (msg.type === 'stage:kick') {
           joinedWantedRef.current = false;
-          cleanupPeer();
+          cleanupAll();
           setStatus('kicked');
         }
       });
 
       dataConn.on('close', () => {
-        if (joinedWantedRef.current && dataRef.current === dataConn) {
-          const wsOpen = wsRelayRef.current?.readyState === WebSocket.OPEN;
-          if (!wsOpen) {
-            setStatus('waiting_stage');
+        if (dataRef.current === dataConn) {
+          setDataConnOpen(false);
+          if (joinedWantedRef.current && !hostSeenOverRelayRef.current) {
+            scheduleQuietWebRtcRetry();
           }
-          retryTimerRef.current = window.setTimeout(connectToStage, 2400);
         }
       });
 
@@ -1025,17 +1077,14 @@ export function useGuestDevicePeer(options: {
       callRef.current = call;
 
       if (!call) {
-        if (wsRelayRef.current?.readyState !== WebSocket.OPEN) {
-          setStatus('waiting_stage');
-        }
-        retryTimerRef.current = window.setTimeout(dialStage, 2400);
+        scheduleQuietWebRtcRetry();
         return;
       }
 
       if (call.peerConnection) {
         call.peerConnection.oniceconnectionstatechange = () => {
-          const state = call.peerConnection?.iceConnectionState;
-          if (state === 'failed') {
+          const iceState = call.peerConnection?.iceConnectionState;
+          if (iceState === 'failed') {
             call.peerConnection?.restartIce?.();
           }
         };
@@ -1047,30 +1096,17 @@ export function useGuestDevicePeer(options: {
         setStatus('connected');
       });
 
-      window.setTimeout(() => {
-        if (
-          joinedWantedRef.current &&
-          callRef.current === call &&
-          dataConn.open
-        ) {
-          setStatus((prev) => (prev === 'connecting' ? 'connected' : prev));
-        }
-      }, 1500);
-
       call.on('close', () => {
-        if (joinedWantedRef.current && callRef.current === call) {
+        if (callRef.current === call) {
           setHostStream(null);
-          if (wsRelayRef.current?.readyState !== WebSocket.OPEN) {
-            setStatus('waiting_stage');
+          if (joinedWantedRef.current && !hostSeenOverRelayRef.current) {
+            scheduleQuietWebRtcRetry();
           }
-          retryTimerRef.current = window.setTimeout(connectToStage, 2400);
         }
       });
     };
 
-    peer.on('open', () => {
-      dialStage();
-    });
+    peer.on('open', dialStage);
 
     peer.on('disconnected', () => {
       if (joinedWantedRef.current && !peer.destroyed) {
@@ -1082,41 +1118,144 @@ export function useGuestDevicePeer(options: {
       }
     });
 
-    peer.on('error', (err) => {
+    peer.on('error', () => {
       if (!joinedWantedRef.current) return;
-      if (
-        err.type === 'peer-unavailable' ||
-        err.type === 'network' ||
-        err.type === 'server-error' ||
-        err.type === 'socket-error'
-      ) {
-        if (wsRelayRef.current?.readyState !== WebSocket.OPEN) {
-          setStatus('waiting_stage');
-          retryTimerRef.current = window.setTimeout(() => {
-            if (joinedWantedRef.current) connectToStage();
-          }, 2400);
-        }
-      } else {
-        setStatus('error');
-      }
+      scheduleQuietWebRtcRetry();
     });
-  }, [cleanupPeer, roomId, sendWsRelay]);
+  }, [cleanupAll, cleanupWebRtc, roomId]);
 
-  // Replace tracks cleanly when switching cameras, OR re-dial if initial call used fallback stream
+  const connectToStage = useCallback(() => {
+    if (!joinedWantedRef.current) return;
+    cleanupAll();
+    webrtcAttemptsRef.current = 0;
+    setStatus('connecting');
+
+    const handleHostPacket = (msg: RelayPacket) => {
+      if (
+        !joinedWantedRef.current ||
+        !msg ||
+        msg.type !== 'media:relay' ||
+        msg.roomId !== roomId ||
+        msg.role !== 'host'
+      ) {
+        return;
+      }
+
+      if (msg.kick) {
+        joinedWantedRef.current = false;
+        cleanupAll();
+        setStatus('kicked');
+        return;
+      }
+
+      hostSeenOverRelayRef.current = true;
+
+      if (msg.hostName || msg.streamTitle) {
+        setStageInfo((prev) => ({
+          hostName: msg.hostName ?? prev.hostName,
+          streamTitle: msg.streamTitle ?? prev.streamTitle,
+          isLive: msg.isLive ?? prev.isLive,
+          guestMutedByHost: msg.guestMutedByHost ?? prev.guestMutedByHost,
+        }));
+      }
+
+      if (typeof msg.needFrames === 'boolean') {
+        setStageNeedsFrames(msg.needFrames);
+      }
+
+      if (msg.frame) {
+        setHostFallbackFrame(msg.frame);
+      }
+
+      setStatus('connected');
+    };
+
+    const sendJoinAnnounce = () => {
+      const m = metaRef.current;
+      sendRelayPacket({
+        joined: true,
+        name: m.type === 'guest:meta' ? m.name : 'Guest Star',
+        camOff: m.type === 'guest:meta' ? m.camOff : false,
+        micMuted: m.type === 'guest:meta' ? m.micMuted : false,
+        mirrored: m.type === 'guest:meta' ? m.mirrored : true,
+        needFrames: m.type === 'guest:meta' ? m.needHostFrames : true,
+      });
+    };
+
+    // 1. Always-on Cloud WSS Relay (works on GitHub Pages + any mobile network)
+    const cloud = new CloudRelayClient({
+      subscribeTopic: getTopicHostToGuest(roomId),
+      onMessage: (raw) => handleHostPacket(raw as RelayPacket),
+      onStatusChange: (open) => {
+        setCloudRelayOpen(open);
+        if (open && joinedWantedRef.current) {
+          sendJoinAnnounce();
+          // Optimistically transition off "connecting" if Stage already replied or wait briefly
+          window.setTimeout(() => {
+            if (joinedWantedRef.current && !hostSeenOverRelayRef.current) {
+              setStatus((prev) =>
+                prev === 'connecting' ? 'waiting_stage' : prev,
+              );
+            }
+          }, 3500);
+        }
+      },
+    });
+    cloudRelayRef.current = cloud;
+
+    // 2. Local Node /ws Relay (only when not on static GitHub Pages)
+    if (supportsLocalWs()) {
+      try {
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+        wsRelayRef.current = ws;
+        ws.onopen = () => {
+          if (!joinedWantedRef.current) return;
+          setWsRelayOpen(true);
+          sendJoinAnnounce();
+        };
+        ws.onmessage = (event) => {
+          try {
+            handleHostPacket(JSON.parse(event.data) as RelayPacket);
+          } catch {
+            // Ignore non-relay payloads
+          }
+        };
+        ws.onclose = () => setWsRelayOpen(false);
+        ws.onerror = () => ws.close();
+      } catch {
+        // Ignore WS failure
+      }
+    }
+
+    // 3. Keepalive + automatic discovery if Host opens Live Output after Guest clicks Join
+    heartbeatTimerRef.current = window.setInterval(() => {
+      if (!joinedWantedRef.current) return;
+      if (!hostSeenOverRelayRef.current) {
+        sendJoinAnnounce();
+      } else {
+        sendRelayPacket({ heartbeat: true });
+      }
+    }, 2800);
+
+    // 4. Independent PeerJS WebRTC upgrade (never tears down Cloud Relay)
+    startWebRtcPeer();
+  }, [cleanupAll, roomId, sendRelayPacket, startWebRtcPeer]);
+
+  // Replace tracks cleanly when switching cameras, OR redial WebRTC if initial call used fallback
   useEffect(() => {
     const call = callRef.current;
     if (!call || !localStream || !joinedWantedRef.current) return;
 
     if (calledWithFallbackRef.current) {
-      connectToStage();
+      startWebRtcPeer();
       return;
     }
 
     if (call.peerConnection) {
       const videoTrack = localStream.getVideoTracks()[0];
       const audioTrack = localStream.getAudioTracks()[0];
-      const senders = call.peerConnection.getSenders();
-      senders.forEach((sender) => {
+      call.peerConnection.getSenders().forEach((sender) => {
         if (sender.track?.kind === 'video' && videoTrack) {
           sender.replaceTrack(videoTrack).catch(() => undefined);
         }
@@ -1125,7 +1264,7 @@ export function useGuestDevicePeer(options: {
         }
       });
     }
-  }, [connectToStage, localStream]);
+  }, [localStream, startWebRtcPeer]);
 
   const joinLive = useCallback(() => {
     joinedWantedRef.current = true;
@@ -1134,21 +1273,21 @@ export function useGuestDevicePeer(options: {
 
   const leaveLive = useCallback(() => {
     joinedWantedRef.current = false;
-    cleanupPeer();
+    cleanupAll();
     setStatus('idle');
-  }, [cleanupPeer]);
+  }, [cleanupAll]);
 
   useEffect(() => {
     const handleBeforeUnload = () => {
-      cleanupPeer();
+      cleanupAll();
     };
     window.addEventListener('beforeunload', handleBeforeUnload);
     return () => {
       window.removeEventListener('beforeunload', handleBeforeUnload);
       joinedWantedRef.current = false;
-      cleanupPeer();
+      cleanupAll();
     };
-  }, [cleanupPeer]);
+  }, [cleanupAll]);
 
   return {
     status,

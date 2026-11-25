@@ -42,8 +42,8 @@ export const VideoStreamPlayer: React.FC<VideoStreamPlayerProps> = ({
       el &&
         el.srcObject &&
         el.readyState >= 2 &&
-        el.videoWidth > 0 &&
-        el.videoHeight > 0,
+        el.videoWidth > 64 &&
+        el.videoHeight > 64,
     );
     setHasDecodedVideo((prev) => {
       if (prev !== ok) {
