@@ -4,11 +4,15 @@ import {
   Camera,
   CameraOff,
   Check,
+  Columns2,
+  Copy,
   Eye,
   FlipHorizontal2,
   Heart,
   Maximize2,
   MessageCircle,
+  Mic,
+  MicOff,
   Minimize2,
   Music2,
   Pin,
@@ -17,6 +21,7 @@ import {
   Share2,
   SlidersHorizontal,
   Sparkles,
+  UserPlus,
   Volume2,
   VolumeX,
 } from 'lucide-react';
@@ -28,6 +33,7 @@ import {
 import type {
   ChatMessage,
   FaceFilterState,
+  GuestStarState,
   HudScale,
   LiveState,
   ReactionBurst,
@@ -35,9 +41,11 @@ import type {
 } from '../types/live.ts';
 import { useCameraStream } from '../hooks/useCameraStream.ts';
 import { useFaceTracker } from '../hooks/useFaceTracker.ts';
+import { useStageGuestPeer } from '../hooks/useGuestStarPeer.ts';
 import { FaceFilterOverlay } from './FaceFilterOverlay.tsx';
 import { GiftVisual } from './GiftVisual.tsx';
 import { ReactionOverlay, type TapHeartPop } from './ReactionOverlay.tsx';
+import { VideoStreamPlayer } from './VideoStreamPlayer.tsx';
 
 interface LiveStageViewProps {
   state: LiveState;
@@ -45,6 +53,7 @@ interface LiveStageViewProps {
   onTriggerBurst: (kind: ReactionKind, count: number) => void;
   onPushChat: (message: Omit<ChatMessage, 'id' | 'timestamp'>) => void;
   onUpdateFilter: (patch: Partial<FaceFilterState>) => void;
+  onUpdateGuestStar: (patch: Partial<GuestStarState>) => void;
   onToggleAudio?: () => void;
   onSwitchToDashboard?: () => void;
 }
@@ -156,6 +165,7 @@ export const LiveStageView: React.FC<LiveStageViewProps> = ({
   onTriggerBurst,
   onPushChat,
   onUpdateFilter,
+  onUpdateGuestStar,
   onToggleAudio,
   onSwitchToDashboard,
 }) => {
@@ -163,7 +173,11 @@ export const LiveStageView: React.FC<LiveStageViewProps> = ({
   const frameRef = useRef<HTMLDivElement | null>(null);
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
 
-  const camera = useCameraStream({ autoStart: true });
+  const camera = useCameraStream({
+    autoStart: true,
+    audio: true,
+    fallbackToVideoOnly: true,
+  });
   const isFaceTrackingActive =
     camera.status === 'active' &&
     Boolean(state.faceFilter.activeFilter && state.faceFilter.faceTrackingEnabled);
@@ -172,6 +186,41 @@ export const LiveStageView: React.FC<LiveStageViewProps> = ({
     videoEl: camera.videoEl,
     active: isFaceTrackingActive,
     mirrored: camera.mirrored,
+  });
+
+  const [guestMicMutedSelf, setGuestMicMutedSelf] = useState(false);
+  const [guestInviteCopied, setGuestInviteCopied] = useState(false);
+
+  const stageGuestPeer = useStageGuestPeer({
+    roomId: state.guestStar.roomId,
+    localStream: camera.status === 'active' ? camera.stream : null,
+    hostName: state.hostName,
+    streamTitle: state.streamTitle,
+    isLive: state.isLive,
+    guestMuted: state.guestStar.guestMuted,
+    guestName: state.guestStar.guestName,
+    onGuestConnected: () => {
+      onUpdateGuestStar({
+        enabled: true,
+        guestJoined: true,
+        guestCamOff: false,
+      });
+    },
+    onGuestDisconnected: () => {
+      setGuestMicMutedSelf(false);
+      onUpdateGuestStar({
+        guestJoined: false,
+        guestCamOff: false,
+      });
+    },
+    onGuestMeta: (meta) => {
+      setGuestMicMutedSelf(meta.micMuted);
+      onUpdateGuestStar({
+        guestName: meta.name || 'Guest Star',
+        guestCamOff: meta.camOff,
+        guestMirrored: meta.mirrored,
+      });
+    },
   });
 
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -276,6 +325,23 @@ export const LiveStageView: React.FC<LiveStageViewProps> = ({
       avatarColor: '#F59E0B',
     });
     setQuickComment('');
+  };
+
+  const guestInviteUrl = useMemo(() => {
+    if (typeof window === 'undefined') {
+      return `${import.meta.env.BASE_URL}?mode=guest&room=${state.guestStar.roomId}`;
+    }
+    return `${window.location.origin}${import.meta.env.BASE_URL}?mode=guest&room=${state.guestStar.roomId}`;
+  }, [state.guestStar.roomId]);
+
+  const handleCopyGuestInvite = async () => {
+    try {
+      await navigator.clipboard.writeText(guestInviteUrl);
+      setGuestInviteCopied(true);
+      window.setTimeout(() => setGuestInviteCopied(false), 1800);
+    } catch {
+      // Ignore clipboard error
+    }
   };
 
   const handleStageShare = async () => {
@@ -387,6 +453,49 @@ export const LiveStageView: React.FC<LiveStageViewProps> = ({
           <span>Mirror</span>
         </button>
 
+        <button
+          type="button"
+          onClick={() =>
+            onUpdateGuestStar({ enabled: !state.guestStar.enabled })
+          }
+          className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg transition-colors cursor-pointer whitespace-nowrap ${
+            state.guestStar.enabled
+              ? 'bg-[#FF3B5C]/25 text-rose-200 border border-[#FF3B5C]/40'
+              : 'hover:bg-white/10'
+          }`}
+          title="Toggle 2-Camera Guest Star split-screen"
+        >
+          <Columns2 className="w-3.5 h-3.5" />
+          <span>{state.guestStar.enabled ? '2-Cam Split' : 'Solo Cam'}</span>
+        </button>
+
+        {state.guestStar.enabled && stageGuestPeer.guestStream && (
+          <button
+            type="button"
+            onClick={() =>
+              onUpdateGuestStar({ guestMuted: !state.guestStar.guestMuted })
+            }
+            className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg transition-colors cursor-pointer whitespace-nowrap ${
+              state.guestStar.guestMuted
+                ? 'bg-rose-500/20 text-rose-200'
+                : 'hover:bg-white/10 text-emerald-300'
+            }`}
+            title="Mute or unmute Guest Star audio"
+          >
+            {state.guestStar.guestMuted ? (
+              <>
+                <MicOff className="w-3.5 h-3.5" />
+                <span>Guest Muted</span>
+              </>
+            ) : (
+              <>
+                <Mic className="w-3.5 h-3.5" />
+                <span>Guest Audio</span>
+              </>
+            )}
+          </button>
+        )}
+
         {onToggleAudio && (
           <button
             type="button"
@@ -460,66 +569,230 @@ export const LiveStageView: React.FC<LiveStageViewProps> = ({
 
       {/* Main Broadcast Stage Canvas (9:16 TikTok or 16:9 Laptop Widescreen) */}
       <div ref={frameRef} onClick={handleStageTap} className={frameClass}>
-        {/* Layer 1: Live Camera Feed or Cozy Studio Fallback */}
-        <div className="absolute inset-0 bg-[#0D0E14]">
-          {camera.status === 'active' ? (
-            <video
-              ref={camera.attachVideoRef}
-              autoPlay
-              playsInline
-              muted
-              className={`w-full h-full object-cover ${
-                camera.mirrored ? '-scale-x-100' : ''
-              }`}
-            />
-          ) : (
-            <div className="relative w-full h-full">
-              {!imgBackdropFailed ? (
-                <img
-                  src={COZY_BACKDROP_URL}
-                  alt="podcastHorizon cozy studio backdrop"
-                  referrerPolicy="no-referrer"
-                  onError={() => setImgBackdropFailed(true)}
-                  className="w-full h-full object-cover opacity-80"
+        {/* Layer 1: Live Camera Feed (Solo or 50/50 TikTok Dual-Cam Guest Star Split) */}
+        {state.guestStar.enabled ? (
+          <div className="absolute inset-0 grid grid-cols-2 bg-[#0D0E14]">
+            {/* Left Half: Host Camera + Face-Tracked AR Gift Filters */}
+            <div className="relative h-full overflow-hidden border-r-[2px] border-black/95 bg-[#0D0E14]">
+              {camera.status === 'active' ? (
+                <video
+                  ref={camera.attachVideoRef}
+                  autoPlay
+                  playsInline
+                  muted
+                  onLoadedMetadata={(e) => {
+                    e.currentTarget.play().catch(() => undefined);
+                  }}
+                  className={`w-full h-full object-cover ${
+                    camera.mirrored ? '-scale-x-100' : ''
+                  }`}
                 />
               ) : (
-                <div className="w-full h-full bg-gradient-to-br from-[#1B1512] via-[#101219] to-[#090A0F]" />
+                <div className="relative w-full h-full">
+                  {!imgBackdropFailed ? (
+                    <img
+                      src={COZY_BACKDROP_URL}
+                      alt="podcastHorizon cozy studio backdrop"
+                      referrerPolicy="no-referrer"
+                      onError={() => setImgBackdropFailed(true)}
+                      className="w-full h-full object-cover opacity-80"
+                    />
+                  ) : (
+                    <div className="w-full h-full bg-gradient-to-br from-[#1B1512] via-[#101219] to-[#090A0F]" />
+                  )}
+                  <div className="absolute inset-0 bg-black/35 backdrop-blur-[1px] flex flex-col items-center justify-center p-4 text-center">
+                    {camera.status === 'requesting' && (
+                      <div className="px-3 py-2 rounded-xl bg-black/60 backdrop-blur-md border border-white/10 text-xs text-zinc-200">
+                        Waiting for camera…
+                      </div>
+                    )}
+                    {camera.status === 'error' && (
+                      <button
+                        type="button"
+                        onClick={() => camera.startCamera()}
+                        className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-[#FF3B5C] hover:bg-[#ff5270] text-white text-xs font-semibold cursor-pointer"
+                      >
+                        <RefreshCw className="w-3.5 h-3.5" />
+                        <span>Enable Host Cam</span>
+                      </button>
+                    )}
+                  </div>
+                </div>
               )}
-              <div className="absolute inset-0 bg-black/35 backdrop-blur-[1px] flex flex-col items-center justify-center p-6 text-center">
-                {camera.status === 'requesting' && (
-                  <div className="px-4 py-3 rounded-2xl bg-black/60 backdrop-blur-md border border-white/10 text-sm text-zinc-200 max-w-xs">
-                    Waiting for camera permission…
+
+              {/* Face-Tracked AR Filter inside Left Host Pane */}
+              <FaceFilterOverlay
+                faceFilter={state.faceFilter}
+                facePose={faceTracker.pose}
+                isPortrait={isPortrait}
+                onDragAdjust={(offsetX, offsetY) =>
+                  onUpdateFilter({ offsetX, offsetY })
+                }
+              />
+            </div>
+
+            {/* Right Half: Device 1 Guest Star Live Camera */}
+            <div className="relative h-full overflow-hidden bg-[#0E1018]">
+              {(stageGuestPeer.guestStream ||
+                stageGuestPeer.guestFallbackFrame) &&
+              !state.guestStar.guestCamOff ? (
+                <VideoStreamPlayer
+                  stream={stageGuestPeer.guestStream}
+                  fallbackFrame={stageGuestPeer.guestFallbackFrame}
+                  onDecodedVideoChange={stageGuestPeer.setGuestHasDecodedVideo}
+                  connectingLabel="Menghubungkan video kamera Guest Star…"
+                  muted={state.guestStar.guestMuted}
+                  mirrored={state.guestStar.guestMirrored}
+                  unmuteLabel="Tap to Unmute Guest"
+                  unmuteButtonClassName="top-16 right-3"
+                />
+              ) : (stageGuestPeer.guestStream ||
+                  stageGuestPeer.guestFallbackFrame) &&
+                state.guestStar.guestCamOff ? (
+                <div className="w-full h-full bg-gradient-to-br from-[#161822] via-[#101218] to-[#090A0F] flex flex-col items-center justify-center p-4 text-center gap-2.5">
+                  <div className="w-16 h-16 rounded-full bg-amber-500/15 border border-amber-400/35 flex items-center justify-center text-lg font-display font-bold text-amber-200">
+                    {(state.guestStar.guestName || 'GS')
+                      .slice(0, 2)
+                      .toUpperCase()}
                   </div>
-                )}
-                {camera.status === 'error' && (
-                  <div className="px-5 py-4 rounded-2xl bg-black/70 backdrop-blur-md border border-white/15 max-w-xs space-y-3">
-                    <p className="text-xs text-zinc-200 leading-relaxed">
-                      {camera.errorMessage}
+                  <div className="text-xs font-semibold text-white">
+                    {state.guestStar.guestName || 'Guest Star'}
+                  </div>
+                  <div className="inline-flex items-center gap-1 text-[11px] text-zinc-400">
+                    <CameraOff className="w-3.5 h-3.5" />
+                    <span>Camera Paused</span>
+                  </div>
+                </div>
+              ) : (
+                <div className="w-full h-full bg-gradient-to-br from-[#161823] via-[#0F1118] to-[#090A0F] flex flex-col items-center justify-center p-4 text-center gap-3">
+                  <div className="w-14 h-14 rounded-full bg-white/5 border border-amber-400/30 flex items-center justify-center relative">
+                    <UserPlus className="w-6 h-6 text-amber-300" />
+                    <span className="absolute -top-0.5 -right-0.5 w-3 h-3 rounded-full bg-amber-400 animate-ping" />
+                  </div>
+                  <div className="space-y-1 max-w-[180px]">
+                    <div className="text-xs font-display font-bold text-white">
+                      {state.guestStar.guestName || 'Guest Star'}
+                    </div>
+                    <p className="text-[11px] text-zinc-400 leading-snug">
+                      Waiting for Device 1 to join via Guest Star link…
                     </p>
-                    <button
-                      type="button"
-                      onClick={() => camera.startCamera()}
-                      className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-[#FF3B5C] hover:bg-[#ff5270] text-white text-xs font-semibold transition-colors cursor-pointer"
-                    >
-                      <RefreshCw className="w-3.5 h-3.5" />
-                      <span>Enable Camera</span>
-                    </button>
                   </div>
+                  <button
+                    type="button"
+                    onClick={handleCopyGuestInvite}
+                    className="relative z-30 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-white/10 hover:bg-white/18 border border-white/15 text-[11px] font-medium text-amber-200 transition-colors cursor-pointer"
+                  >
+                    {guestInviteCopied ? (
+                      <>
+                        <Check className="w-3 h-3 text-emerald-400" />
+                        <span>Guest Link Copied</span>
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="w-3 h-3" />
+                        <span>Copy Guest Link</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+              )}
+
+              {/* TikTok-Style Guest Star Name Badge (Bottom-Right of Guest Pane, above action buttons) */}
+              <div
+                className={`absolute right-3 sm:right-4 z-20 inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-black/55 backdrop-blur-md border border-white/15 text-xs font-semibold text-white shadow-lg max-w-[85%] ${
+                  isPortrait ? 'bottom-[74px]' : 'bottom-[76px]'
+                }`}
+              >
+                {state.guestStar.guestMuted || guestMicMutedSelf ? (
+                  <MicOff className="w-3 h-3 text-rose-400 shrink-0" />
+                ) : (
+                  <span className="w-2 h-2 rounded-full bg-emerald-400 shrink-0" />
                 )}
+                <span className="truncate">
+                  {state.guestStar.guestName || 'Guest Star'}
+                </span>
               </div>
             </div>
-          )}
-        </div>
 
-        {/* Layer 1.5: Face-Tracked Wearable AR Gift Filters */}
-        <FaceFilterOverlay
-          faceFilter={state.faceFilter}
-          facePose={faceTracker.pose}
-          isPortrait={isPortrait}
-          onDragAdjust={(offsetX, offsetY) =>
-            onUpdateFilter({ offsetX, offsetY })
-          }
-        />
+            {/* Center Top Equalizer Bars Badge on Vertical Divider (just like TikTok Live Dual Cam) */}
+            <div
+              aria-hidden="true"
+              className={`pointer-events-none absolute left-1/2 -translate-x-1/2 z-20 px-2.5 py-1.5 rounded-lg bg-black/65 backdrop-blur-md border border-white/15 flex items-end gap-[3px] ${
+                isPortrait ? 'top-[76px]' : 'top-4'
+              }`}
+            >
+              <span className="w-[2px] h-2.5 bg-white/85 rounded-full animate-pulse" />
+              <span className="w-[2px] h-4 bg-white rounded-full animate-pulse" />
+              <span className="w-[2px] h-2 bg-amber-300 rounded-full animate-pulse" />
+              <span className="w-[2px] h-3.5 bg-white/90 rounded-full animate-pulse" />
+            </div>
+          </div>
+        ) : (
+          <>
+            <div className="absolute inset-0 bg-[#0D0E14]">
+              {camera.status === 'active' ? (
+                <video
+                  ref={camera.attachVideoRef}
+                  autoPlay
+                  playsInline
+                  muted
+                  onLoadedMetadata={(e) => {
+                    e.currentTarget.play().catch(() => undefined);
+                  }}
+                  className={`w-full h-full object-cover ${
+                    camera.mirrored ? '-scale-x-100' : ''
+                  }`}
+                />
+              ) : (
+                <div className="relative w-full h-full">
+                  {!imgBackdropFailed ? (
+                    <img
+                      src={COZY_BACKDROP_URL}
+                      alt="podcastHorizon cozy studio backdrop"
+                      referrerPolicy="no-referrer"
+                      onError={() => setImgBackdropFailed(true)}
+                      className="w-full h-full object-cover opacity-80"
+                    />
+                  ) : (
+                    <div className="w-full h-full bg-gradient-to-br from-[#1B1512] via-[#101219] to-[#090A0F]" />
+                  )}
+                  <div className="absolute inset-0 bg-black/35 backdrop-blur-[1px] flex flex-col items-center justify-center p-6 text-center">
+                    {camera.status === 'requesting' && (
+                      <div className="px-4 py-3 rounded-2xl bg-black/60 backdrop-blur-md border border-white/10 text-sm text-zinc-200 max-w-xs">
+                        Waiting for camera permission…
+                      </div>
+                    )}
+                    {camera.status === 'error' && (
+                      <div className="px-5 py-4 rounded-2xl bg-black/70 backdrop-blur-md border border-white/15 max-w-xs space-y-3">
+                        <p className="text-xs text-zinc-200 leading-relaxed">
+                          {camera.errorMessage}
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => camera.startCamera()}
+                          className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-[#FF3B5C] hover:bg-[#ff5270] text-white text-xs font-semibold transition-colors cursor-pointer"
+                        >
+                          <RefreshCw className="w-3.5 h-3.5" />
+                          <span>Enable Camera</span>
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Layer 1.5: Face-Tracked Wearable AR Gift Filters */}
+            <FaceFilterOverlay
+              faceFilter={state.faceFilter}
+              facePose={faceTracker.pose}
+              isPortrait={isPortrait}
+              onDragAdjust={(offsetX, offsetY) =>
+                onUpdateFilter({ offsetX, offsetY })
+              }
+            />
+          </>
+        )}
 
         {/* Measured Top & Bottom Scrims */}
         <div

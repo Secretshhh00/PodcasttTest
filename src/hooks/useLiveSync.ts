@@ -10,6 +10,7 @@ import type {
   ChatMessage,
   FaceFilterState,
   GiftId,
+  GuestStarState,
   HudScale,
   LiveState,
   ReactionBurst,
@@ -73,13 +74,36 @@ const DEFAULT_STATE: LiveState = {
     volume: 0.38,
     sfxEnabled: true,
   },
+  guestStar: {
+    enabled: false,
+    roomId: `hz-${Math.random().toString(36).slice(2, 6)}`,
+    guestName: 'Guest Star',
+    guestJoined: false,
+    guestMuted: false,
+    guestCamOff: false,
+    guestMirrored: true,
+  },
 };
 
+function getRoomIdFromUrl(): string | null {
+  if (typeof window === 'undefined') return null;
+  const r = new URLSearchParams(window.location.search).get('room');
+  return r && r.trim() ? r.trim() : null;
+}
+
 function loadInitialState(): LiveState {
+  const urlRoomId = getRoomIdFromUrl();
   if (typeof window === 'undefined') return DEFAULT_STATE;
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (!raw) return DEFAULT_STATE;
+    if (!raw) {
+      return urlRoomId
+        ? {
+            ...DEFAULT_STATE,
+            guestStar: { ...DEFAULT_STATE.guestStar, roomId: urlRoomId },
+          }
+        : DEFAULT_STATE;
+    }
     const parsed = JSON.parse(raw) as Partial<LiveState>;
     if (!parsed || typeof parsed !== 'object') return DEFAULT_STATE;
     const now = Date.now();
@@ -91,6 +115,18 @@ function loadInitialState(): LiveState {
       rawFilter.activeFilter !== null &&
       rawFilter.expiresAt !== null &&
       rawFilter.expiresAt <= now;
+    const mergedGuestStar: GuestStarState = parsed.guestStar
+      ? {
+          ...DEFAULT_STATE.guestStar,
+          ...parsed.guestStar,
+          // Never assume stale live WebRTC connection from previous browser session
+          guestJoined: false,
+          roomId: urlRoomId || parsed.guestStar.roomId || DEFAULT_STATE.guestStar.roomId,
+        }
+      : {
+          ...DEFAULT_STATE.guestStar,
+          roomId: urlRoomId || DEFAULT_STATE.guestStar.roomId,
+        };
     return {
       ...DEFAULT_STATE,
       ...parsed,
@@ -106,6 +142,7 @@ function loadInitialState(): LiveState {
       ambientAudio: parsed.ambientAudio
         ? { ...DEFAULT_STATE.ambientAudio, ...parsed.ambientAudio }
         : DEFAULT_STATE.ambientAudio,
+      guestStar: mergedGuestStar,
     };
   } catch {
     return DEFAULT_STATE;
@@ -145,6 +182,9 @@ function reduceLocalState(prev: LiveState, action: SyncClientAction): LiveState 
         ambientAudio: action.patch.ambientAudio
           ? { ...prev.ambientAudio, ...action.patch.ambientAudio }
           : prev.ambientAudio,
+        guestStar: action.patch.guestStar
+          ? { ...prev.guestStar, ...action.patch.guestStar }
+          : prev.guestStar,
       };
     case 'stream:toggle_live':
       return {
@@ -244,6 +284,16 @@ function reduceLocalState(prev: LiveState, action: SyncClientAction): LiveState 
         activeGifts: prunedGifts,
         faceFilter: {
           ...baseFilter,
+          ...action.patch,
+        },
+      };
+    case 'guest:update':
+      return {
+        ...prev,
+        activeGifts: prunedGifts,
+        faceFilter: baseFilter,
+        guestStar: {
+          ...prev.guestStar,
           ...action.patch,
         },
       };
@@ -575,6 +625,29 @@ export function useLiveSync(options?: { defaultAudioLeader?: boolean }) {
     [dispatch],
   );
 
+  const updateGuestStar = useCallback(
+    (patch: Partial<GuestStarState>) => {
+      dispatch({
+        type: 'guest:update',
+        eventId: makeEventId(),
+        patch,
+      });
+    },
+    [dispatch],
+  );
+
+  const regenerateGuestRoom = useCallback(() => {
+    const nextRoom = `hz-${Math.random().toString(36).slice(2, 6)}`;
+    dispatch({
+      type: 'guest:update',
+      eventId: makeEventId(),
+      patch: {
+        roomId: nextRoom,
+        guestJoined: false,
+      },
+    });
+  }, [dispatch]);
+
   const toggleLive = useCallback(
     (isLive: boolean) => {
       dispatch({
@@ -696,6 +769,8 @@ export function useLiveSync(options?: { defaultAudioLeader?: boolean }) {
     setHudScale,
     patchState,
     updateFaceFilter,
+    updateGuestStar,
+    regenerateGuestRoom,
     toggleLive,
     resetTimer,
     pushChat,

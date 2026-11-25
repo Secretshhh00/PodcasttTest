@@ -129,6 +129,16 @@ export interface AmbientAudioState {
   sfxEnabled: boolean;
 }
 
+export interface GuestStarState {
+  enabled: boolean;
+  roomId: string;
+  guestName: string;
+  guestJoined: boolean;
+  guestMuted: boolean;
+  guestCamOff: boolean;
+  guestMirrored: boolean;
+}
+
 export interface LiveState {
   hostName: string;
   streamTitle: string;
@@ -146,6 +156,7 @@ export interface LiveState {
   faceFilter: FaceFilterState;
   nowPlaying: NowPlayingState;
   ambientAudio: AmbientAudioState;
+  guestStar: GuestStarState;
 }
 
 export type SyncClientAction =
@@ -172,6 +183,11 @@ export type SyncClientAction =
       type: 'filter:update';
       eventId: string;
       patch: Partial<FaceFilterState>;
+    }
+  | {
+      type: 'guest:update';
+      eventId: string;
+      patch: Partial<GuestStarState>;
     }
   | { type: 'qa:set_active'; eventId: string; qaId: string | null }
   | { type: 'qa:add'; eventId: string; item: QaItem }

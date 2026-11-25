@@ -68,6 +68,15 @@ let liveState: LiveState = {
     volume: 0.38,
     sfxEnabled: true,
   },
+  guestStar: {
+    enabled: false,
+    roomId: `hz-${Math.random().toString(36).slice(2, 6)}`,
+    guestName: 'Guest Star',
+    guestJoined: false,
+    guestMuted: false,
+    guestCamOff: false,
+    guestMirrored: true,
+  },
 };
 
 function pruneExpired(state: LiveState): LiveState {
@@ -117,6 +126,9 @@ function applyAction(action: SyncClientAction): LiveState {
         faceFilter: action.patch.faceFilter
           ? { ...liveState.faceFilter, ...action.patch.faceFilter }
           : liveState.faceFilter,
+        guestStar: action.patch.guestStar
+          ? { ...liveState.guestStar, ...action.patch.guestStar }
+          : liveState.guestStar,
       };
       return liveState;
     }
@@ -239,6 +251,17 @@ function applyAction(action: SyncClientAction): LiveState {
       return liveState;
     }
 
+    case 'guest:update': {
+      liveState = {
+        ...liveState,
+        guestStar: {
+          ...liveState.guestStar,
+          ...action.patch,
+        },
+      };
+      return liveState;
+    }
+
     case 'qa:set_active': {
       liveState = {
         ...liveState,
@@ -296,7 +319,20 @@ async function startServer() {
 
     ws.on('message', (raw) => {
       try {
-        const parsed = JSON.parse(raw.toString()) as SyncClientAction;
+        const rawStr = raw.toString();
+        const parsed = JSON.parse(rawStr) as
+          | SyncClientAction
+          | { type: 'media:relay'; roomId: string; role: 'guest' | 'host'; frame?: string; camOff?: boolean; name?: string };
+
+        if (parsed.type === 'media:relay') {
+          for (const client of wss.clients) {
+            if (client !== ws && client.readyState === WebSocket.OPEN) {
+              client.send(rawStr);
+            }
+          }
+          return;
+        }
+
         if (parsed.type === 'state:request') {
           liveState = pruneExpired(liveState);
           const reply: SyncServerMessage = {

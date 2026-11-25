@@ -5,20 +5,54 @@
 
 import { useEffect, useState } from 'react';
 import { ControlDashboard } from './components/ControlDashboard.tsx';
+import { GuestStarView } from './components/GuestStarView.tsx';
 import { LiveStageView } from './components/LiveStageView.tsx';
 import { useLiveSync } from './hooks/useLiveSync.ts';
 
-type AppMode = 'dashboard' | 'stage';
+type AppMode = 'dashboard' | 'stage' | 'guest';
 
 function resolveInitialMode(): AppMode {
   if (typeof window === 'undefined') return 'dashboard';
   const params = new URLSearchParams(window.location.search);
-  return params.get('mode') === 'stage' ? 'stage' : 'dashboard';
+  const m = params.get('mode');
+  if (m === 'stage') return 'stage';
+  if (m === 'guest') return 'guest';
+  return 'dashboard';
+}
+
+function resolveRoomParam(): string | null {
+  if (typeof window === 'undefined') return null;
+  const r = new URLSearchParams(window.location.search).get('room');
+  return r && r.trim() ? r.trim() : null;
 }
 
 export default function App() {
   const [mode, setMode] = useState<AppMode>(resolveInitialMode);
+  const [urlRoomId, setUrlRoomId] = useState<string | null>(resolveRoomParam);
 
+  useEffect(() => {
+    const onPopState = () => {
+      setMode(resolveInitialMode());
+      setUrlRoomId(resolveRoomParam());
+    };
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, []);
+
+  if (mode === 'guest') {
+    return <GuestStarView roomId={urlRoomId || 'hz-live'} />;
+  }
+
+  return <OperatorStudioApp mode={mode} setMode={setMode} />;
+}
+
+function OperatorStudioApp({
+  mode,
+  setMode,
+}: {
+  mode: 'dashboard' | 'stage';
+  setMode: (m: AppMode) => void;
+}) {
   // Play soothing ambient audio cleanly from the operator dashboard tab (prevents double-audio across tabs)
   const {
     state,
@@ -28,6 +62,8 @@ export default function App() {
     setHudScale,
     patchState,
     updateFaceFilter,
+    updateGuestStar,
+    regenerateGuestRoom,
     toggleLive,
     resetTimer,
     pushChat,
@@ -39,21 +75,15 @@ export default function App() {
     removeQaItem,
   } = useLiveSync({ defaultAudioLeader: mode === 'dashboard' });
 
-  useEffect(() => {
-    const onPopState = () => {
-      setMode(resolveInitialMode());
-    };
-    window.addEventListener('popstate', onPopState);
-    return () => window.removeEventListener('popstate', onPopState);
-  }, []);
-
-  const switchMode = (nextMode: AppMode) => {
+  const switchMode = (nextMode: 'dashboard' | 'stage') => {
     setMode(nextMode);
     const url = new URL(window.location.href);
     if (nextMode === 'stage') {
       url.searchParams.set('mode', 'stage');
+      url.searchParams.set('room', state.guestStar.roomId);
     } else {
       url.searchParams.delete('mode');
+      url.searchParams.delete('room');
     }
     window.history.pushState({}, '', url.toString());
   };
@@ -66,6 +96,7 @@ export default function App() {
         onTriggerBurst={triggerBurst}
         onPushChat={pushChat}
         onUpdateFilter={updateFaceFilter}
+        onUpdateGuestStar={updateGuestStar}
         onToggleAudio={() =>
           patchState({
             ambientAudio: {
@@ -87,6 +118,8 @@ export default function App() {
       onSetHudScale={setHudScale}
       onPatchState={patchState}
       onUpdateFilter={updateFaceFilter}
+      onUpdateGuestStar={updateGuestStar}
+      onRegenerateGuestRoom={regenerateGuestRoom}
       onToggleLive={toggleLive}
       onResetTimer={resetTimer}
       onPushChat={pushChat}
